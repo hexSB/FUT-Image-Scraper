@@ -1,6 +1,24 @@
 # FUTWIZ Image Scraper
 
-Scrapes a FUTWIZ FC player page, saves `player.json`, and downloads discovered image assets into `images/`.
+A Python scraper for FUTWIZ FC 26 player cards.
+
+The scraper can:
+
+- scrape one FUTWIZ player profile page
+- scrape all rendered player cards on a FUTWIZ listing page
+- scrape multiple consecutive listing pages
+- save card metadata as JSON
+- save the cleaned card HTML needed to recreate the card
+- save a standalone `card_render.html` preview page
+- download the card background image and player face image
+
+For listing pages, the scraper uses the player cards already rendered on the listing page. It does not open every individual player profile.
+
+## Requirements
+
+- Python 3.9+
+- `pip`
+- Playwright Chromium browser
 
 ## Setup
 
@@ -11,53 +29,114 @@ pip install -r requirements.txt
 playwright install chromium
 ```
 
-## Run
+If your shell cannot find `python`, use `python3` instead.
 
-Single player:
+## Usage
+
+Scrape one player profile:
 
 ```bash
 python scrape_futwiz.py "https://www.futwiz.com/fc26/player/john-stones/25827" -o output/john-stones
 ```
 
-Players listing page:
+Scrape one listing page:
 
 ```bash
 python scrape_futwiz.py "https://www.futwiz.com/fc26/players" -o output/players
 ```
 
-Multiple consecutive listing pages:
+Scrape multiple consecutive listing pages:
 
 ```bash
 python scrape_futwiz.py "https://www.futwiz.com/fc26/players?page=2&sort=rating&direction=desc" -o output/players --pages 5
 ```
 
-The script tries a normal HTTP request first. If FUTWIZ returns Cloudflare, it opens a visible browser. Complete the Cloudflare check in that browser, wait until the FUTWIZ player page is visible, then press Enter in the terminal.
+That command scrapes pages `2` through `6`. To scrape the next five pages, start at page `7`:
+
+```bash
+python scrape_futwiz.py "https://www.futwiz.com/fc26/players?page=7&sort=rating&direction=desc" -o output/players --pages 5
+```
+
+Save image URLs without downloading images:
+
+```bash
+python scrape_futwiz.py "https://www.futwiz.com/fc26/players" -o output/players --no-download
+```
 
 ## Output
 
-`player.json` contains:
+Single-player scrape:
 
-- player name, version, rating, and position
-- profile fields such as club, league, nationality, skill moves, weak foot, height, player ID, and card ID
-- face stats and detailed in-game stats
-- the full `.fc-card` HTML in the `card_html` JSON field, also written to `card.html`
-- a standalone `card_render.html` file that includes the page CSS links for visual rendering
-- the card background image and player image URLs, with local filenames for downloaded files
+```text
+output/john-stones/
+  player.json
+  card.html
+  card_render.html
+  images/
+    background-1.webp
+    player_image-1.webp
+```
 
-Images are limited to the card background and player image used by the card HTML.
+Listing-page scrape:
 
-The exported card HTML removes FUTWIZ's side overlays for playstyles, alternate positions, and skill/weak-foot/foot details.
+```text
+output/players/
+  index.json
+  john-stones/
+    91-cb-item-25-face-50535222-25827/
+      player.json
+      card.html
+      card_render.html
+      images/
+```
 
-For listing pages, each profile is saved under a player-name folder with a nested card-variant folder. This keeps cards for players with the same name together without overwriting distinct images or card types. The top-level `index.json` contains the profile URLs, output folders, names, ratings, positions, and any failures.
+The listing output groups cards by player name. Different versions of the same player are stored in nested variant directories so they do not overwrite each other.
 
-Listing-page scraping uses the rendered cards already present on the listing page. It does not open every player profile URL. Because of that, listing outputs include the card HTML, render page, card images, and visible face stats from the card; detailed profile-only fields remain empty unless you scrape an individual profile URL.
+`player.json` includes:
+
+- source URL
+- player/card name
+- rating
+- position
+- visible face stats
+- detailed profile stats, when scraping an individual profile page
+- cleaned `.fc-card` HTML
+- image URLs and local filenames
+
+`card.html` contains only the cleaned card fragment.
+
+`card_render.html` wraps the card in a minimal HTML page and links the FUTWIZ stylesheets so the card can be previewed more like it appears on FUTWIZ.
+
+The exported card HTML removes these FUTWIZ side overlays:
+
+- playstyles
+- alternate positions
+- skill moves, weak foot, and foot panel
+
+## Cloudflare Handling
+
+The script first tries a normal HTTP request. If FUTWIZ blocks that request, it opens a visible Chromium browser through Playwright.
+
+The browser usually continues automatically once the real card content appears. If a Cloudflare or interstitial page remains visible, the script prompts you to complete the check manually and press Enter.
+
+This does not bypass Cloudflare. It only lets the person running the script complete any required browser check normally.
 
 ## Saved HTML Fallback
 
-If the browser flow is not available, save the FUTWIZ page HTML from your browser and run:
+If browser automation is unavailable, save the FUTWIZ page HTML from your browser and run:
 
 ```bash
 python scrape_futwiz.py "https://www.futwiz.com/fc26/player/john-stones/25827" --html saved-page.html -o output/john-stones
 ```
 
-Use `--no-download` to store only image URLs.
+`--html` is intended for one page at a time.
+
+## Disclaimers
+
+This project is for personal/local data collection and experimentation.
+
+Before scraping FUTWIZ or using downloaded assets, review FUTWIZ's terms of service and robots policy. Player images, card designs, badges, flags, league logos, and other assets may be copyrighted or otherwise restricted.
+
+Do not use this scraper to overload FUTWIZ. Avoid high request rates, repeated unnecessary downloads, or public redistribution of scraped assets unless you have the rights to do so.
+
+The page structure on FUTWIZ can change. If class names like `.fc-card` or `.fc25-card__face__altimg` change, the scraper may need updates.
