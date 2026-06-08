@@ -161,6 +161,23 @@ def is_listing_url(url: str) -> bool:
     return path.endswith("/players")
 
 
+def inject_release_param(url: str, release_id: int) -> str:
+    parsed = urlparse(url)
+    query_params = [(k, v) for k, v in parse_qsl(parsed.query) if k != "release[]"]
+    query_params.append(("release[]", str(release_id)))
+    return urlunparse(parsed._replace(query=urlencode(query_params)))
+
+
+def write_players_index(profiles: list[dict], output_dir: Path) -> None:
+    players = [
+        {"name": p.get("name", ""), "rating": p.get("rating"), "position": p.get("position", "")}
+        for p in profiles
+    ]
+    (output_dir / "players.json").write_text(
+        json.dumps(players, indent=2, ensure_ascii=False), encoding="utf-8"
+    )
+
+
 def player_output_name(url: str) -> str:
     parts = [part for part in urlparse(url).path.split("/") if part]
     if len(parts) >= 2:
@@ -208,21 +225,27 @@ def profile_id_from_url(url: str) -> str:
     return parts[-1] if parts and parts[-1].isdigit() else ""
 
 
-def listing_output_dir(output_dir: Path, card: Tag, source_url: str, fallback_index: int) -> Path:
+def listing_output_dir(output_dir: Path, card: Tag, _source_url: str, fallback_index: int) -> Path:
     summary = extract_card_summary(card)
     player_slug = slugify(str(summary.get("name") or summary.get("card_name") or f"player-{fallback_index}"))
-    variant_parts = [
-        str(summary.get("rating") or "nr"),
-        str(summary.get("position") or "pos"),
-        f"item-{card_background_id(card)}",
-        f"face-{card_face_id(card)}",
-    ]
-    profile_id = profile_id_from_url(source_url)
-    if profile_id:
-        variant_parts.append(profile_id)
-    else:
-        variant_parts.append(f"card-{fallback_index}")
-    return output_dir / player_slug / slugify("-".join(variant_parts))
+    return next_player_version_dir(output_dir / player_slug)
+
+
+def next_player_version_dir(player_dir: Path) -> Path:
+    highest_version = 0
+    existing_variants = 0
+
+    if player_dir.exists():
+        for child in player_dir.iterdir():
+            if not child.is_dir():
+                continue
+            existing_variants += 1
+            match = re.fullmatch(r"v(\d+)", child.name)
+            if match:
+                highest_version = max(highest_version, int(match.group(1)))
+
+    next_version = max(highest_version, existing_variants) + 1
+    return player_dir / f"v{next_version}"
 
 
 def extract_player_links(soup: BeautifulSoup, base_url: str) -> list[str]:
@@ -432,15 +455,38 @@ def absolute_attrs(tag: Tag, base_url: str) -> None:
             tag[attr] = urljoin(base_url, str(tag[attr]))
 
 
+def css_background_value(value: str, image_size: str) -> str:
+    value = value.strip()
+    lower = value.lower()
+    if lower.startswith(("url(", "#", "rgb(", "rgba(", "hsl(", "hsla(")) or "gradient(" in lower:
+        return value
+    escaped = value.replace("\\", "\\\\").replace('"', '\\"')
+    return f'url("{escaped}") center / {image_size} no-repeat'
+
+
+def apply_card_background(card: Tag, background: str | None) -> None:
+    if not background:
+        return
+
+    style = str(card.get("style", "")).rstrip()
+    if style and not style.endswith(";"):
+        style += ";"
+    style += f" background: {css_background_value(background, 'contain')};"
+    card["style"] = style
+
+
 def extract_card_render_page(
     soup: BeautifulSoup,
     base_url: str,
     output_dir: Path,
     card: Tag | None = None,
+    page_background: str = "#111",
+    card_background: str | None = None,
 ) -> str | None:
     card = clean_card_for_export(card or soup.select_one(".fc-card"))
     if not card:
         return None
+    apply_card_background(card, card_background)
 
     head_parts: list[str] = []
     for tag in soup.find_all(["link", "style"]):
@@ -471,7 +517,7 @@ def extract_card_render_page(
       min-height: 100vh;
       display: grid;
       place-items: center;
-      background: #111;
+      background: {css_background_value(page_background, 'cover')};
     }}
   </style>
 </head>
@@ -486,6 +532,7 @@ def extract_card_render_page(
 </html>
 """
     filename = "card_render.html"
+    output_dir.mkdir(parents=True, exist_ok=True)
     (output_dir / filename).write_text(html, encoding="utf-8")
     return filename
 
@@ -577,12 +624,24 @@ def scrape_listing_card(
     output_dir: Path,
     source_url: str,
     download: bool,
+    render_output_dir: Path | None = None,
+    render_page_background: str = "#111",
+    render_card_background: str | None = None,
 ) -> dict[str, object]:
     output_dir.mkdir(parents=True, exist_ok=True)
     fragment_soup = BeautifulSoup(str(card), "html.parser")
     assets = collect_images(fragment_soup, listing_url)
     card_html = write_card_html(card, output_dir)
     render_filename = extract_card_render_page(listing_soup, listing_url, output_dir, card)
+    if render_output_dir:
+        extract_card_render_page(
+            listing_soup,
+            listing_url,
+            render_output_dir,
+            card,
+            page_background=render_page_background,
+            card_background=render_card_background,
+        )
     card_html["render_filename"] = render_filename
     if download:
         assets = download_images(session, output_dir, assets)
@@ -607,6 +666,9 @@ def scrape_player_html(
     output_dir: Path,
     html: str,
     download: bool,
+    render_output_dir: Path | None = None,
+    render_page_background: str = "#111",
+    render_card_background: str | None = None,
 ) -> dict[str, object]:
     soup = BeautifulSoup(html, "html.parser")
 
@@ -617,6 +679,14 @@ def scrape_player_html(
     output_dir.mkdir(parents=True, exist_ok=True)
     card_html = extract_card_html(soup, output_dir)
     render_filename = extract_card_render_page(soup, url, output_dir)
+    if render_output_dir:
+        extract_card_render_page(
+            soup,
+            url,
+            render_output_dir,
+            page_background=render_page_background,
+            card_background=render_card_background,
+        )
     card_html["render_filename"] = render_filename
     if download:
         assets = download_images(session, output_dir, assets)
@@ -641,14 +711,45 @@ def scrape_player(
     html_path: Path | None,
     browser_fallback: bool,
     download: bool,
+    render_output_dir: Path | None = None,
+    render_page_background: str = "#111",
+    render_card_background: str | None = None,
 ) -> dict[str, object]:
     html = load_html(session, url, html_path, browser_fallback)
-    return scrape_player_html(session, url, output_dir, html, download)
+    return scrape_player_html(
+        session,
+        url,
+        output_dir,
+        html,
+        download,
+        render_output_dir=render_output_dir,
+        render_page_background=render_page_background,
+        render_card_background=render_card_background,
+    )
 
 
-def scrape(url: str, output_dir: Path, html_path: Path | None, browser_fallback: bool, download: bool) -> dict[str, object]:
+def scrape(
+    url: str,
+    output_dir: Path,
+    html_path: Path | None,
+    browser_fallback: bool,
+    download: bool,
+    render_output_dir: Path | None = None,
+    render_page_background: str = "#111",
+    render_card_background: str | None = None,
+) -> dict[str, object]:
     session = make_session()
-    return scrape_player(session, url, output_dir, html_path, browser_fallback, download)
+    return scrape_player(
+        session,
+        url,
+        output_dir,
+        html_path,
+        browser_fallback,
+        download,
+        render_output_dir=render_output_dir,
+        render_page_background=render_page_background,
+        render_card_background=render_card_background,
+    )
 
 
 def scrape_listing_page(
@@ -658,6 +759,9 @@ def scrape_listing_page(
     html_path: Path | None,
     browser_fallback: bool,
     download: bool,
+    render_output_dir: Path | None = None,
+    render_page_background: str = "#111",
+    render_card_background: str | None = None,
 ) -> dict[str, object]:
     html = load_html(session, url, html_path, browser_fallback)
     soup = BeautifulSoup(html, "html.parser")
@@ -673,9 +777,21 @@ def scrape_listing_page(
         player_url = find_card_profile_url(card, url, index)
         summary = extract_card_summary(card)
         player_dir = listing_output_dir(output_dir, card, player_url, index)
+        custom_render_dir = render_output_dir / player_dir.relative_to(output_dir) if render_output_dir else None
         print(f"[{index}/{len(cards)}] Saving rendered card {summary.get('name') or player_dir.name}")
         try:
-            data = scrape_listing_card(session, soup, url, card, player_dir, player_url, download)
+            data = scrape_listing_card(
+                session,
+                soup,
+                url,
+                card,
+                player_dir,
+                player_url,
+                download,
+                render_output_dir=custom_render_dir,
+                render_page_background=render_page_background,
+                render_card_background=render_card_background,
+            )
         except Exception as exc:
             print(f"Failed {player_url}: {exc}", file=sys.stderr)
             failures.append({"url": player_url, "error": str(exc)})
@@ -709,6 +825,9 @@ def scrape_listing(
     browser_fallback: bool,
     download: bool,
     pages: int = 1,
+    render_output_dir: Path | None = None,
+    render_page_background: str = "#111",
+    render_card_background: str | None = None,
 ) -> dict[str, object]:
     if html_path and pages > 1:
         raise RuntimeError("--html can only be used with one listing page at a time.")
@@ -722,7 +841,17 @@ def scrape_listing(
     urls = listing_page_urls(url, pages)
     for page_index, page_url in enumerate(urls, start=1):
         print(f"Scraping listing page {page_index}/{len(urls)}: {page_url}")
-        manifest = scrape_listing_page(session, page_url, output_dir, html_path, browser_fallback, download)
+        manifest = scrape_listing_page(
+            session,
+            page_url,
+            output_dir,
+            html_path,
+            browser_fallback,
+            download,
+            render_output_dir=render_output_dir,
+            render_page_background=render_page_background,
+            render_card_background=render_card_background,
+        )
         page_manifests.append(manifest)
         all_profiles.extend(manifest["profiles"])  # type: ignore[arg-type]
         all_failures.extend(manifest["failures"])  # type: ignore[arg-type]
@@ -749,13 +878,53 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--html", type=Path, help="Parse a saved HTML page instead of fetching")
     parser.add_argument("--no-browser", action="store_true", help="Do not open a browser if Cloudflare appears")
     parser.add_argument("--no-download", action="store_true", help="Save image URLs only")
-    parser.add_argument("--pages", type=int, default=1, help="For listing URLs, scrape this many consecutive pages")
+    parser.add_argument("--pages", type=int, default=1, help="For listing URLs, scrape this many consecutive pages (per release type if --releases is used)")
+    parser.add_argument(
+        "--releases", nargs="+", type=int, metavar="ID",
+        help="Scrape specific release types (e.g. --releases 25 111). "
+             "Each type is scraped from page 0 to --pages-1 and saved in a separate folder.",
+    )
+    parser.add_argument("--render-output", type=Path, help="Optional separate directory for customized card_render.html files")
+    parser.add_argument(
+        "--render-page-background",
+        default="#111",
+        help="CSS color/image/gradient for the HTML render page background",
+    )
+    parser.add_argument(
+        "--render-card-background",
+        help="CSS color/image/gradient to apply to the exported card in the separate render output",
+    )
     return parser.parse_args()
 
 
 def main() -> int:
     args = parse_args()
     try:
+        if args.releases:
+            base_output = Path(args.output)
+            base_output.mkdir(parents=True, exist_ok=True)
+            for release_id in args.releases:
+                release_url = inject_release_param(args.url, release_id)
+                release_dir = base_output / f"release_{release_id}"
+                print(f"\n=== Scraping release {release_id} ===")
+                data = scrape_listing(
+                    url=release_url,
+                    output_dir=release_dir,
+                    html_path=args.html,
+                    browser_fallback=not args.no_browser,
+                    download=not args.no_download,
+                    pages=args.pages,
+                    render_output_dir=args.render_output,
+                    render_page_background=args.render_page_background,
+                    render_card_background=args.render_card_background,
+                )
+                profiles = data.get("profiles", [])
+                write_players_index(profiles, release_dir)
+                print(f"Release {release_id}: {data.get('profiles_scraped')}/{data.get('profiles_found')} profiles scraped")
+                print(f"  Saved to {release_dir}")
+                print(f"  Player index: {release_dir / 'players.json'}")
+            return 0
+
         if is_listing_url(args.url):
             data = scrape_listing(
                 url=args.url,
@@ -764,6 +933,9 @@ def main() -> int:
                 browser_fallback=not args.no_browser,
                 download=not args.no_download,
                 pages=args.pages,
+                render_output_dir=args.render_output,
+                render_page_background=args.render_page_background,
+                render_card_background=args.render_card_background,
             )
         else:
             data = scrape(
@@ -772,6 +944,9 @@ def main() -> int:
                 html_path=args.html,
                 browser_fallback=not args.no_browser,
                 download=not args.no_download,
+                render_output_dir=args.render_output,
+                render_page_background=args.render_page_background,
+                render_card_background=args.render_card_background,
             )
     except Exception as exc:
         print(f"Error: {exc}", file=sys.stderr)
@@ -780,9 +955,13 @@ def main() -> int:
     if is_listing_url(args.url):
         print(f"Saved listing scrape manifest to {Path(args.output) / 'index.json'}")
         print(f"Profiles scraped: {data.get('profiles_scraped')} / {data.get('profiles_found')}")
+        if args.render_output:
+            print(f"Saved customized renders to {args.render_output}")
     else:
         print(f"Saved {data.get('name') or 'player'} to {Path(args.output) / 'player.json'}")
         print(f"Images discovered: {len(data.get('images', []))}")
+        if args.render_output:
+            print(f"Saved customized render to {args.render_output / 'card_render.html'}")
     return 0
 
 
