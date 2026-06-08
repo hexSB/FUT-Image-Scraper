@@ -767,7 +767,14 @@ def scrape_listing_page(
     soup = BeautifulSoup(html, "html.parser")
     cards = soup.select(".fc-card")
     if not cards:
-        raise RuntimeError("No rendered player cards were found on the listing page.")
+        return {
+            "source_url": url,
+            "profiles_found": 0,
+            "profiles_scraped": 0,
+            "profiles_failed": 0,
+            "profiles": [],
+            "failures": [],
+        }
 
     output_dir.mkdir(parents=True, exist_ok=True)
     results: list[dict[str, object]] = []
@@ -852,6 +859,9 @@ def scrape_listing(
             render_page_background=render_page_background,
             render_card_background=render_card_background,
         )
+        if not manifest["profiles"]:
+            print(f"No players found on page {page_index}, stopping pagination for this release type.")
+            break
         page_manifests.append(manifest)
         all_profiles.extend(manifest["profiles"])  # type: ignore[arg-type]
         all_failures.extend(manifest["failures"])  # type: ignore[arg-type]
