@@ -126,6 +126,11 @@ def fetch_html_with_browser(url: str) -> tuple[str, list[dict[str, str]]]:
         try:
             page.wait_for_selector(".fc-card", timeout=15_000)
         except Exception:
+            html = page.content()
+            if "No Players Found" in html:
+                browser.close()
+                cookie_dicts = [{"name": cookie["name"], "value": cookie["value"], "domain": cookie["domain"]} for cookie in context.cookies()]
+                return html, cookie_dicts
             print("Cloudflare or another interstitial still appears to be blocking the player page.")
             print("Complete it in the opened browser, wait for the FUTWIZ player page to load, then return here.")
             input("Press Enter after the real FUTWIZ page is visible...")
