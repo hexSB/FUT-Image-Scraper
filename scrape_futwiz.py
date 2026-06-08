@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import sys
 from dataclasses import asdict, dataclass
@@ -49,6 +50,19 @@ class CloudflareChallenge(RuntimeError):
 
 def clean_text(value: str) -> str:
     return re.sub(r"\s+", " ", value).strip()
+
+
+def is_empty_listing_page(html: str) -> bool:
+    soup = BeautifulSoup(html, "html.parser")
+    page_text = clean_text(soup.get_text(" "))
+    return "No Players Found" in page_text
+
+
+def browser_cookie_dicts(cookies: list[dict[str, object]]) -> list[dict[str, str]]:
+    return [
+        {"name": str(cookie["name"]), "value": str(cookie["value"]), "domain": str(cookie["domain"])}
+        for cookie in cookies
+    ]
 
 
 def slugify(value: str) -> str:
@@ -124,26 +138,41 @@ def fetch_html_with_browser(url: str) -> tuple[str, list[dict[str, str]]]:
         page = context.new_page()
         page.goto(url, wait_until="domcontentloaded", timeout=90_000)
         try:
-            page.wait_for_selector(".fc-card", timeout=15_000)
+            page.wait_for_function(
+                """() =>
+                    document.querySelector(".fc-card")
+                    || document.body?.innerText.includes("No Players Found")
+                """,
+                timeout=15_000,
+            )
         except Exception:
             html = page.content()
-            if "No Players Found" in html:
+            if is_empty_listing_page(html):
+                cookies = context.cookies()
                 browser.close()
-                cookie_dicts = [{"name": cookie["name"], "value": cookie["value"], "domain": cookie["domain"]} for cookie in context.cookies()]
-                return html, cookie_dicts
+                return html, browser_cookie_dicts(cookies)
             print("Cloudflare or another interstitial still appears to be blocking the player page.")
             print("Complete it in the opened browser, wait for the FUTWIZ player page to load, then return here.")
             input("Press Enter after the real FUTWIZ page is visible...")
-            page.wait_for_selector(".fc-card", timeout=60_000)
+            page.wait_for_function(
+                """() =>
+                    document.querySelector(".fc-card")
+                    || document.body?.innerText.includes("No Players Found")
+                """,
+                timeout=60_000,
+            )
         html = page.content()
+        if is_empty_listing_page(html):
+            cookies = context.cookies()
+            browser.close()
+            return html, browser_cookie_dicts(cookies)
         cookies = context.cookies()
         browser.close()
 
     if is_cloudflare_page(html):
         raise CloudflareChallenge("The browser is still showing the Cloudflare challenge.")
 
-    cookie_dicts = [{"name": cookie["name"], "value": cookie["value"], "domain": cookie["domain"]} for cookie in cookies]
-    return html, cookie_dicts
+    return html, browser_cookie_dicts(cookies)
 
 
 def load_html(session: requests.Session, url: str, html_path: Path | None, browser_fallback: bool) -> str:
@@ -555,13 +584,38 @@ def extension_from_response(url: str, response: requests.Response) -> str:
     }.get(content_type, ".img")
 
 
-def download_images(session: requests.Session, output_dir: Path, assets: list[ImageAsset]) -> list[ImageAsset]:
+def relative_filename(path: Path, output_dir: Path) -> str:
+    return os.path.relpath(path, output_dir)
+
+
+def download_images(
+    session: requests.Session,
+    output_dir: Path,
+    assets: list[ImageAsset],
+    shared_output_dir: Path | None = None,
+    shared_kinds: set[str] | None = None,
+    shared_cache: dict[str, Path] | None = None,
+) -> list[ImageAsset]:
     image_dir = output_dir / "images"
     image_dir.mkdir(parents=True, exist_ok=True)
     counters: dict[str, int] = {}
     saved_assets: list[ImageAsset] = []
 
     for asset in assets:
+        if shared_output_dir and shared_kinds and asset.kind in shared_kinds:
+            cache_key = asset.kind
+            if shared_cache is not None and cache_key in shared_cache:
+                saved_assets.append(
+                    ImageAsset(asset.kind, asset.url, asset.alt, relative_filename(shared_cache[cache_key], output_dir))
+                )
+                continue
+
+            target_image_dir = shared_output_dir / "images"
+            target_image_dir.mkdir(parents=True, exist_ok=True)
+        else:
+            cache_key = None
+            target_image_dir = image_dir
+
         counters[asset.kind] = counters.get(asset.kind, 0) + 1
         try:
             response = session.get(asset.url, timeout=30)
@@ -572,9 +626,11 @@ def download_images(session: requests.Session, output_dir: Path, assets: list[Im
             continue
 
         filename = f"{asset.kind}-{counters[asset.kind]}{extension_from_response(asset.url, response)}"
-        path = image_dir / filename
+        path = target_image_dir / filename
         path.write_bytes(response.content)
-        saved_assets.append(ImageAsset(asset.kind, asset.url, asset.alt, str(path.relative_to(output_dir))))
+        if shared_cache is not None and cache_key:
+            shared_cache[cache_key] = path
+        saved_assets.append(ImageAsset(asset.kind, asset.url, asset.alt, relative_filename(path, output_dir)))
 
     return saved_assets
 
@@ -632,6 +688,9 @@ def scrape_listing_card(
     render_output_dir: Path | None = None,
     render_page_background: str = "#111",
     render_card_background: str | None = None,
+    shared_image_output_dir: Path | None = None,
+    shared_image_kinds: set[str] | None = None,
+    shared_image_cache: dict[str, Path] | None = None,
 ) -> dict[str, object]:
     output_dir.mkdir(parents=True, exist_ok=True)
     fragment_soup = BeautifulSoup(str(card), "html.parser")
@@ -649,7 +708,14 @@ def scrape_listing_card(
         )
     card_html["render_filename"] = render_filename
     if download:
-        assets = download_images(session, output_dir, assets)
+        assets = download_images(
+            session,
+            output_dir,
+            assets,
+            shared_output_dir=shared_image_output_dir,
+            shared_kinds=shared_image_kinds,
+            shared_cache=shared_image_cache,
+        )
 
     face_stats = extract_card_face_stats(card)
     data: dict[str, object] = {
@@ -767,6 +833,9 @@ def scrape_listing_page(
     render_output_dir: Path | None = None,
     render_page_background: str = "#111",
     render_card_background: str | None = None,
+    shared_image_output_dir: Path | None = None,
+    shared_image_kinds: set[str] | None = None,
+    shared_image_cache: dict[str, Path] | None = None,
 ) -> dict[str, object]:
     html = load_html(session, url, html_path, browser_fallback)
     soup = BeautifulSoup(html, "html.parser")
@@ -803,6 +872,9 @@ def scrape_listing_page(
                 render_output_dir=custom_render_dir,
                 render_page_background=render_page_background,
                 render_card_background=render_card_background,
+                shared_image_output_dir=shared_image_output_dir,
+                shared_image_kinds=shared_image_kinds,
+                shared_image_cache=shared_image_cache,
             )
         except Exception as exc:
             print(f"Failed {player_url}: {exc}", file=sys.stderr)
@@ -840,6 +912,8 @@ def scrape_listing(
     render_output_dir: Path | None = None,
     render_page_background: str = "#111",
     render_card_background: str | None = None,
+    shared_image_output_dir: Path | None = None,
+    shared_image_kinds: set[str] | None = None,
 ) -> dict[str, object]:
     if html_path and pages > 1:
         raise RuntimeError("--html can only be used with one listing page at a time.")
@@ -849,6 +923,7 @@ def scrape_listing(
     page_manifests: list[dict[str, object]] = []
     all_profiles: list[dict[str, object]] = []
     all_failures: list[dict[str, str]] = []
+    shared_image_cache: dict[str, Path] = {}
 
     urls = listing_page_urls(url, pages)
     for page_index, page_url in enumerate(urls, start=1):
@@ -863,6 +938,9 @@ def scrape_listing(
             render_output_dir=render_output_dir,
             render_page_background=render_page_background,
             render_card_background=render_card_background,
+            shared_image_output_dir=shared_image_output_dir,
+            shared_image_kinds=shared_image_kinds,
+            shared_image_cache=shared_image_cache,
         )
         if not manifest["profiles"]:
             print(f"No players found on page {page_index}, stopping pagination for this release type.")
@@ -932,6 +1010,8 @@ def main() -> int:
                     render_output_dir=args.render_output,
                     render_page_background=args.render_page_background,
                     render_card_background=args.render_card_background,
+                    shared_image_output_dir=release_dir,
+                    shared_image_kinds={"background"},
                 )
                 profiles = data.get("profiles", [])
                 write_players_index(profiles, release_dir)
